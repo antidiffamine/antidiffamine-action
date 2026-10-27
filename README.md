@@ -4,6 +4,8 @@ See the clean diff between two branches of a force-push to a pull request.
 
 When a PR branch is rebased onto a newer base and force-pushed, GitHub's "compare" view between the before and after commits mixes the author's edits with every commit that landed on the base branch in the meantime. AntiDiffamine rebases the old commits onto the new base first, then diffs. You get only the changes made inside the PR, alongside a `git range-diff` and any merge conflicts the rebase hit.
 
+AntiDiffamine only runs on pull requests, on every push to an open PR (`synchronize`). It reads the before and after commits and the base branch from the PR event. On any other event (pushes to `main`, `workflow_dispatch`, schedules, or a PR being opened) it prints a notice and does nothing.
+
 Results always appear in the Actions run summary. On top of that, you can switch each of these features on or off:
 
 | Feature | Input | Default | Needs |
@@ -46,22 +48,17 @@ If your organization restricts the default token, also enable **Settings → Act
 
 | Input | Default | Description |
 |---|---|---|
-| `source` | `github.event.before` | Commit SHA before the force-push. |
-| `target` | `github.event.after` | Commit SHA after the force-push. |
-| `base_branch` | `github.base_ref` | Base branch the PR targets. |
-| `repo` | `github.repository` | `owner/repo` containing the commits. |
 | `token` | `github.token` | Token used to clone, push to `gh-pages` and comment. |
 | `html_enabled` | `true` | Render `diff.html` and upload it as a workflow artifact. |
 | `pages` | `false` | Publish `diff.html` to GitHub Pages under `gh-pages/runs/<run-id>/`. Requires `html_enabled`. |
-| `comment` | `true` | Post a PR comment with links to the diff (PR events only). |
+| `comment` | `true` | Post a PR comment with links to the diff. |
 | `fail_on_rebase_failure` | `true` | Fail the step when the rebase cannot be completed even with `-X theirs`, so only a partial diff is shown. |
-
-Outside of `pull_request` events (e.g. `workflow_dispatch`), pass `source`, `target` and `base_branch` explicitly.
 
 ## Outputs
 
 | Output | Description |
 |---|---|
+| `skipped` | `true` when the event isn't a push to an open PR, so nothing ran. |
 | `bases_match` | `true` when source and target share the same merge base. No rebase is needed, so the diff and comment are skipped. |
 | `had_conflicts` | `true` when the first rebase hit merge conflicts. |
 | `rebase_failed` | `true` when the second rebase (`-X theirs`) also failed. |
@@ -69,8 +66,10 @@ Outside of `pull_request` events (e.g. `workflow_dispatch`), pass `source`, `tar
 
 ## How it works
 
-1. Compute the fork point of `source` and of `target` on `base_branch`.
-2. If they are equal, a plain compare is already accurate, so the action stops there.
+With `source` = the PR head before the push (`github.event.before`) and `target` = the head after it (`github.event.after`):
+
+1. Compute the fork point of `source` and of `target` on the PR's base branch.
+2. If they are equal, a plain compare is already accurate, so the action stops there. This covers ordinary, non-rebasing pushes.
 3. Otherwise rebase `source_base..source` onto `target_base`. If that conflicts, record the conflict markers and retry with `-X theirs`.
 4. Diff the rebased result against `target`, and run `git range-diff source_base..source target_base..rebased`.
 5. Write everything to the job summary and, if `pages: true`, to `gh-pages/runs/<run-id>/index.html`.
@@ -95,6 +94,10 @@ Each run adds `runs/<run-id>/` to `gh-pages`. To keep the branch from growing fo
 Summary only: no comment, no artifact, no Pages, read-only token:
 
 ```yaml
+on:
+  pull_request_target:
+    types: [synchronize]
+
 permissions:
   contents: read
 
@@ -106,29 +109,6 @@ jobs:
         with:
           comment: false
           html_enabled: false
-```
-
-## Running on a specific pair of commits
-
-```yaml
-on:
-  workflow_dispatch:
-    inputs:
-      source: { required: true }
-      target: { required: true }
-      base_branch: { required: true, default: main }
-
-jobs:
-  antidiffamine:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: antidiffamine/antidiffamine-action@v1
-        with:
-          source: ${{ inputs.source }}
-          target: ${{ inputs.target }}
-          base_branch: ${{ inputs.base_branch }}
 ```
 
 ## License

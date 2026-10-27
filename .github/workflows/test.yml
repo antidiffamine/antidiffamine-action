@@ -1,37 +1,32 @@
 name: Test
 
 on:
-  workflow_dispatch:
   pull_request:
 
 jobs:
-  # Hetero-ancestral pairs from kubernetes/kubernetes (see README).
-  smoke:
+  lint:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: no-conflicts
-            source: cfb9303d9708f9a2e67b2b2960cc23aa04af7574
-            target: 8058052052ec2729ac564b0130affedd0cc63533
-          - name: conflicts
-            source: 94ec47a849e4a21b1bbf4649314c69daea86f018
-            target: a35dc76581afb8cd8567ff357531c1deab353460
-    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check action.yml and renderer
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('action.yml'))"
+          python3 -m py_compile src/render.py
+
+  # Runs this branch's action on pushes to its own PR. Force-push a rebased
+  # branch to exercise the full path; end-to-end scenarios live in antidiffamine-test.
+  dogfood:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - id: ad
         uses: ./
         with:
-          repo: kubernetes/kubernetes
-          source: ${{ matrix.source }}
-          target: ${{ matrix.target }}
-          base_branch: master
-          html_enabled: false
           comment: false
-      - name: Check outputs
+          html_enabled: false
+      - name: Show outputs
         run: |
+          echo "skipped=${{ steps.ad.outputs.skipped }}"
           echo "bases_match=${{ steps.ad.outputs.bases_match }}"
           echo "had_conflicts=${{ steps.ad.outputs.had_conflicts }}"
-          test "${{ steps.ad.outputs.bases_match }}" = "false"
+          echo "rebase_failed=${{ steps.ad.outputs.rebase_failed }}"

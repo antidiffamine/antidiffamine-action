@@ -6,23 +6,9 @@ branding:
   icon: git-pull-request
   color: blue
 
+# Runs only on pull_request / pull_request_target "synchronize" events (a push to
+# an open PR). The before/after commits and the base branch come from the event.
 inputs:
-  source:
-    description: Commit SHA before the force-push.
-    required: false
-    default: ${{ github.event.before }}
-  target:
-    description: Commit SHA after the force-push.
-    required: false
-    default: ${{ github.event.after }}
-  base_branch:
-    description: Base branch the PR targets (e.g. main).
-    required: false
-    default: ${{ github.base_ref }}
-  repo:
-    description: owner/repo containing the commits.
-    required: false
-    default: ${{ github.repository }}
   token:
     description: Token used to clone, push to gh-pages and comment. Needs contents:write for Pages and pull-requests:write for comments.
     required: false
@@ -36,7 +22,7 @@ inputs:
     required: false
     default: 'false'
   comment:
-    description: Post a PR comment linking to the diff (only on pull_request / pull_request_target events). Requires pull-requests:write.
+    description: Post a PR comment linking to the diff. Requires pull-requests:write.
     required: false
     default: 'true'
   fail_on_rebase_failure:
@@ -45,6 +31,9 @@ inputs:
     default: 'true'
 
 outputs:
+  skipped:
+    description: "'true' when the event is not a push to an open PR, so nothing ran."
+    value: ${{ steps.guard.outputs.skipped }}
   bases_match:
     description: "'true' when source and target share the same merge base (no rebase needed; diff and comment are skipped)."
     value: ${{ steps.bases.outputs.bases_match }}
@@ -61,22 +50,33 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Clone repo
+    - name: Check event
+      id: guard
       shell: bash
       env:
-        SOURCE: ${{ inputs.source }}
-        TARGET: ${{ inputs.target }}
-        BASE_BRANCH: ${{ inputs.base_branch }}
-        REPO: ${{ inputs.repo }}
+        EVENT: ${{ github.event_name }}
+        ACTION: ${{ github.event.action }}
+        SOURCE: ${{ github.event.before }}
+        TARGET: ${{ github.event.after }}
+      run: |
+        if [[ "$EVENT" =~ ^pull_request(_target)?$ && "$ACTION" == synchronize && -n "$SOURCE" && -n "$TARGET" ]]; then
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice title=AntiDiffamine::Skipped: only runs on pushes to an open PR (pull_request / pull_request_target 'synchronize'), got '$EVENT' '$ACTION'."
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Clone repo
+      if: steps.guard.outputs.skipped == 'false'
+      shell: bash
+      env:
+        SOURCE: ${{ github.event.before }}
+        TARGET: ${{ github.event.after }}
+        BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        REPO: ${{ github.repository }}
         GITHUB_TOKEN: ${{ inputs.token }}
         WORK: ${{ runner.temp }}/antidiffamine
       run: |
-        for v in SOURCE TARGET BASE_BRANCH REPO; do
-          if [ -z "${!v}" ]; then
-            echo "::error title=AntiDiffamine::Missing input for $v. Outside pull_request events, pass source, target and base_branch explicitly."
-            exit 1
-          fi
-        done
         rm -rf "$WORK" && mkdir -p "$WORK"
         git clone --filter=blob:none "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" "$WORK/repo"
         cd "$WORK/repo"
@@ -84,12 +84,13 @@ runs:
 
     - name: Compute merge bases
       id: bases
+      if: steps.guard.outputs.skipped == 'false'
       shell: bash
       working-directory: ${{ runner.temp }}/antidiffamine/repo
       env:
-        SOURCE: ${{ inputs.source }}
-        TARGET: ${{ inputs.target }}
-        BASE_BRANCH: ${{ inputs.base_branch }}
+        SOURCE: ${{ github.event.before }}
+        TARGET: ${{ github.event.after }}
+        BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
       run: |
         # The clone only has a local branch for the default branch; use the remote-tracking ref
         ref="origin/$BASE_BRANCH"
@@ -116,7 +117,7 @@ runs:
       shell: bash
       working-directory: ${{ runner.temp }}/antidiffamine/repo
       env:
-        SOURCE: ${{ inputs.source }}
+        SOURCE: ${{ github.event.before }}
         SOURCE_BASE: ${{ steps.bases.outputs.source_base }}
         TARGET_BASE: ${{ steps.bases.outputs.target_base }}
         GIT_AUTHOR_NAME: AntiDiffamine
@@ -159,7 +160,7 @@ runs:
       shell: bash
       working-directory: ${{ runner.temp }}/antidiffamine/repo
       env:
-        SOURCE: ${{ inputs.source }}
+        SOURCE: ${{ github.event.before }}
         SOURCE_BASE: ${{ steps.bases.outputs.source_base }}
         TARGET_BASE: ${{ steps.bases.outputs.target_base }}
         GIT_AUTHOR_NAME: AntiDiffamine
@@ -183,7 +184,7 @@ runs:
       if: steps.bases.outputs.bases_match == 'true'
       shell: bash
       env:
-        COMPARE_URL: https://github.com/${{ inputs.repo }}/compare/${{ inputs.source }}..${{ inputs.target }}
+        COMPARE_URL: https://github.com/${{ github.repository }}/compare/${{ github.event.before }}..${{ github.event.after }}
       run: |
         {
           echo "## 🧪 No AntiDiffamine needed"
@@ -198,9 +199,9 @@ runs:
       shell: bash
       working-directory: ${{ runner.temp }}/antidiffamine/repo
       env:
-        SOURCE: ${{ inputs.source }}
-        TARGET: ${{ inputs.target }}
-        REPO: ${{ inputs.repo }}
+        SOURCE: ${{ github.event.before }}
+        TARGET: ${{ github.event.after }}
+        REPO: ${{ github.repository }}
         SOURCE_BASE: ${{ steps.bases.outputs.source_base }}
         TARGET_BASE: ${{ steps.bases.outputs.target_base }}
         REBASE_FAILED: ${{ steps.second_rebase.outputs.rebase_failed }}
@@ -304,13 +305,13 @@ runs:
         echo "Page URL: $PAGE_URL"
 
     - name: Comment on PR
-      if: inputs.comment == 'true' && github.event.pull_request && steps.bases.outputs.bases_match == 'false'
+      if: inputs.comment == 'true' && steps.bases.outputs.bases_match == 'false'
       uses: actions/github-script@v7
       env:
         PAGE_URL: ${{ steps.deploy.outputs.page_url }}
-        SOURCE: ${{ inputs.source }}
-        TARGET: ${{ inputs.target }}
-        BASE_BRANCH: ${{ inputs.base_branch }}
+        SOURCE: ${{ github.event.before }}
+        TARGET: ${{ github.event.after }}
+        BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
         REBASE_FAILED: ${{ steps.second_rebase.outputs.rebase_failed }}
       with:
         github-token: ${{ inputs.token }}
