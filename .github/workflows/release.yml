@@ -1,5 +1,7 @@
-# On each published release: point the major tag (v1, v2, ...) at it so users
-# on @v1 get it, then run the end-to-end scenario PRs in antidiffamine-test.
+# Release flow:
+#   publish a pre-release vX.Y.Z  -> scenario PRs in antidiffamine-test run against @vX.Y.Z
+#   promote it to a full release  -> major tag vX moves to it, so users on @vX get it
+# Publishing a full release directly does both.
 #
 # Needs secret TEST_REPO_TOKEN: a fine-grained token for antidiffamine/antidiffamine-test
 # with Contents: read and write (to send repository_dispatch).
@@ -7,11 +9,29 @@ name: Release
 
 on:
   release:
-    types: [published]
+    # "published" fires for pre-releases and full releases; "released" fires for
+    # full releases, including a pre-release being promoted.
+    types: [published, released]
 
 jobs:
+  scenario-tests:
+    if: github.event.action == 'published'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger scenario PRs in antidiffamine-test
+        env:
+          GH_TOKEN: ${{ secrets.TEST_REPO_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/antidiffamine/antidiffamine-test/dispatches \
+            -d "{\"event_type\":\"action-released\",\"client_payload\":{\"version\":\"$TAG\"}}"
+          echo "Testing $TAG — results: https://github.com/antidiffamine/antidiffamine-test/actions/workflows/release-test.yml" >> "$GITHUB_STEP_SUMMARY"
+
   move-major-tag:
-    if: ${{ !github.event.release.prerelease }}
+    if: github.event.action == 'released'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -31,19 +51,3 @@ jobs:
           git tag -f "$major" "$TAG"
           git push -f origin "refs/tags/$major"
           echo "Moved $major -> $TAG ($(git rev-parse --short "$TAG"))"
-
-  scenario-tests:
-    needs: move-major-tag
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger scenario PRs in antidiffamine-test
-        env:
-          GH_TOKEN: ${{ secrets.TEST_REPO_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          curl -fsS -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/antidiffamine/antidiffamine-test/dispatches \
-            -d "{\"event_type\":\"action-released\",\"client_payload\":{\"version\":\"$TAG\"}}"
-          echo "Results: https://github.com/antidiffamine/antidiffamine-test/actions/workflows/release-test.yml" >> "$GITHUB_STEP_SUMMARY"
