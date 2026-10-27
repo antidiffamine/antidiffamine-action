@@ -11,16 +11,23 @@ html_enabled = html_enabled != 'false'
 
 import pathlib
 
+def _read(name, default=''):
+  p = pathlib.Path(name)
+  return p.read_text(errors='replace') if p.exists() else default
+
+# Change the stopped PR commit tried to make to the files it could not apply (partial mode only)
+intended_diff = ''
+stopped_commit = ''
+
 if from_ref == '__partial__':
-  # Second rebase failed: read diff saved before abort
-  def _read(name, default=''):
-    p = pathlib.Path(name)
-    return p.read_text(errors='replace') if p.exists() else default
-  stat     = _read('rebase_partial_stat.txt', '(no stat available)').strip()
-  raw_diff = _read('rebase_partial_diff.txt')
+  # Second rebase failed: read diff saved before abort. Unmerged paths have no
+  # content to diff, so drop their placeholder lines and show the intended change instead.
+  stat = '\n'.join(l for l in _read('rebase_partial_stat.txt').splitlines() if '| Unmerged' not in l and 'files changed' not in l and 'file changed' not in l).strip()
+  stat = stat or '(no changes could be applied before the conflict)'
+  raw_diff = '\n'.join(l for l in _read('rebase_partial_diff.txt').splitlines() if not l.startswith('* Unmerged path '))
   commits  = _read('rebase_partial_commits.txt', '').strip()
-  # range-diff: compare source range vs target range (not rebased HEAD)
-  range_diff_tip = to_ref
+  intended_diff = _read('rebase_intended_diff.txt')
+  stopped_commit = _read('rebase_stopped_commit.txt').strip()
 else:
   stat = subprocess.check_output(
     ['git', 'diff', '--stat', from_ref, to_ref]
@@ -31,14 +38,14 @@ else:
   commits = subprocess.check_output(
     ['git', 'log', '--oneline', f'{from_ref}..{to_ref}']
   ).decode('utf-8', errors='replace').strip()
-  range_diff_tip = from_ref
 
-# range-diff: old range = source_base..source_sha, new range = target_base..range_diff_tip
+# range-diff: old range = source_base..source_sha, new range = target_base..to_ref,
+# so it shows how the author's commits were rewritten, added or dropped
 range_diff = ''
 range_diff_error = ''
 try:
   range_diff = subprocess.check_output(
-    ['git', 'range-diff', f'{source_base}..{source_sha}', f'{target_base}..{range_diff_tip}'],
+    ['git', 'range-diff', f'{source_base}..{source_sha}', f'{target_base}..{to_ref}'],
     stderr=subprocess.PIPE
   ).decode('utf-8', errors='replace').strip()
   if not range_diff:
@@ -88,15 +95,21 @@ def render_range_diff(raw):
   return summary + f'<table style="width:100%;border-collapse:collapse">{"".join(rows)}</table>'
 
 # Split diff into per-file blocks
-file_blocks = []
-current = []
-for line in raw_diff.splitlines():
-  if line.startswith('diff --git ') and current:
-    file_blocks.append('\n'.join(current))
-    current = []
-  current.append(line)
-if current:
-  file_blocks.append('\n'.join(current))
+def split_blocks(diff):
+  blocks = []
+  current = []
+  for line in diff.splitlines():
+    if line.startswith('diff --git ') and current:
+      blocks.append('\n'.join(current))
+      current = []
+    current.append(line)
+  if current:
+    blocks.append('\n'.join(current))
+  return [b for b in blocks if b.strip()]
+
+file_blocks = split_blocks(raw_diff)
+intended_blocks = split_blocks(intended_diff)
+stopped_label = f' — from commit {stopped_commit}' if stopped_commit else ''
 
 def render_file(block):
   lines = block.splitlines()
@@ -146,7 +159,28 @@ if os.path.exists('conflict_details.txt'):
   if cur_file is not None:
     conflict_sections.append((cur_file, cur_lines))
 
+# Conflict type per file from `git status --porcelain`. During a rebase, "us" is
+# the base branch and "them" is the PR commit being replayed.
+CONFLICT_KINDS = {
+  'UU': 'modified on both the base branch and in the PR',
+  'AA': 'added on both the base branch and in the PR, with different content',
+  'DU': 'deleted on the base branch, modified in the PR',
+  'UD': 'modified on the base branch, deleted in the PR',
+  'AU': 'added on the base branch, conflicting with the PR',
+  'UA': 'added in the PR, conflicting with the base branch',
+  'DD': 'deleted on both sides',
+}
+conflict_kinds = {}
+for line in _read('conflict_status.txt').splitlines():
+  if len(line) > 3:
+    conflict_kinds[line[3:]] = CONFLICT_KINDS.get(line[:2], f'unmerged ({line[:2]})')
+
 def render_conflict_file(filename, lines, context=3):
+  # Conflicts without markers (modify/delete, ...) have nothing to highlight; say what happened
+  if not any(l.startswith('<<<<<<<') for l in lines):
+    kind = conflict_kinds.get(filename, 'conflict without content markers')
+    S = 'font-family:ui-monospace,monospace;font-size:12px;padding:6px 8px'
+    return f'<table style="width:100%;border-collapse:collapse"><tr style="background:#fff8c5"><td style="{S};color:#6e4f0a">{html.escape(filename)}: {html.escape(kind)}. There are no conflict markers to show.</td></tr></table>'
   # Find conflict block ranges (0-based indices)
   conflict_ranges = []
   i = 0
@@ -190,9 +224,9 @@ def render_conflict_file(filename, lines, context=3):
         region = None
         rows.append(f'<tr style="background:#acf2bd"><td colspan="2" style="{LN};color:#1a7f37;font-weight:600">{ln}</td><td style="{S};color:#1a7f37;font-weight:600">{html.escape(l)}</td></tr>')
       elif region == 'ours':
-        rows.append(f'<tr style="background:#ffeef0"><td style="{LN}">{ln}</td><td style="{LB};background:#fdb8c0;color:#86181d">ours</td><td style="{S}">{html.escape(l)}</td></tr>')
+        rows.append(f'<tr style="background:#ffeef0"><td style="{LN}">{ln}</td><td style="{LB};background:#fdb8c0;color:#86181d">base</td><td style="{S}">{html.escape(l)}</td></tr>')
       elif region == 'theirs':
-        rows.append(f'<tr style="background:#e6ffec"><td style="{LN}">{ln}</td><td style="{LB};background:#acf2bd;color:#1a7f37">theirs</td><td style="{S}">{html.escape(l)}</td></tr>')
+        rows.append(f'<tr style="background:#e6ffec"><td style="{LN}">{ln}</td><td style="{LB};background:#acf2bd;color:#1a7f37">PR</td><td style="{S}">{html.escape(l)}</td></tr>')
       else:
         rows.append(f'<tr><td style="{LN}">{ln}</td><td style="{LB}"></td><td style="{S}">{html.escape(l)}</td></tr>')
     prev_end = we
@@ -272,6 +306,11 @@ for block in file_blocks:
     continue
   fname, table = render_file(block)
   body += f'<details><summary>{html.escape(fname)}</summary>{table}</details>\n'
+if intended_blocks:
+  body += f'<div class="conflict-header" style="margin-top:12px">⚠️ Intended change (could not be applied){html.escape(stopped_label)}</div>\n'
+  for block in intended_blocks:
+    fname, table = render_file(block)
+    body += f'<details class="conflict-header"><summary>{html.escape(fname)}</summary>{table}</details>\n'
 if conflict_sections:
   body += '<div class="conflict-header" style="margin-top:12px">⚠️ Merge Conflicts detected during first rebase</div>\n'
   for fname, lines in conflict_sections:
@@ -307,6 +346,11 @@ with open(summary_path, 'a') as f:
     blines = block.splitlines()
     fname = next((l[6:] for l in blines if l.startswith('+++ b/')), 'unknown')
     f.write(f"<details><summary><code>{html.escape(fname)}</code></summary>\n\n```diff\n{block}\n```\n\n</details>\n\n")
+  if intended_blocks:
+    f.write(f"#### ⚠️ Intended change (could not be applied){stopped_label}\n\n")
+    for block in intended_blocks:
+      fname = next((l[6:] for l in block.splitlines() if l.startswith('+++ b/')), 'unknown')
+      f.write(f"<details><summary><code>{html.escape(fname)}</code></summary>\n\n```diff\n{block}\n```\n\n</details>\n\n")
   f.write('</div>\n\n')
   # 2. Merge conflicts with line numbers and context
   if conflict_sections:

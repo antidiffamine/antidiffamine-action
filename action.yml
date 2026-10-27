@@ -141,6 +141,8 @@ runs:
             cat "$f" >> conflict_details.txt
             echo "" >> conflict_details.txt
           done
+          # Conflict type per file (UU, DU, ...) for conflicts that leave no markers
+          git status --porcelain | grep -E '^(DD|AU|UD|UA|DU|AA|UU) ' > conflict_status.txt || true
           git rebase --abort
           echo "had_conflicts=true" >> "$GITHUB_OUTPUT"
         else
@@ -174,6 +176,12 @@ runs:
           git diff --stat > rebase_partial_stat.txt 2>/dev/null || true
           git diff --unified=3 > rebase_partial_diff.txt 2>/dev/null || true
           git log --oneline "${TARGET_BASE}..HEAD" > rebase_partial_commits.txt 2>/dev/null || true
+          # What the stopped PR commit tried to do to the files it could not apply
+          unmerged=$(git diff --name-only --diff-filter=U)
+          if [ -n "$unmerged" ] && git rev-parse -q --verify REBASE_HEAD >/dev/null; then
+            git log -1 --format='%h %s' REBASE_HEAD > rebase_stopped_commit.txt
+            git show --format= REBASE_HEAD -- $unmerged > rebase_intended_diff.txt || true
+          fi
           git rebase --abort
           echo "rebase_failed=true" >> "$GITHUB_OUTPUT"
         else

@@ -1,0 +1,49 @@
+# On each published release: point the major tag (v1, v2, ...) at it so users
+# on @v1 get it, then run the end-to-end scenario PRs in antidiffamine-test.
+#
+# Needs secret TEST_REPO_TOKEN: a fine-grained token for antidiffamine/antidiffamine-test
+# with Contents: read and write (to send repository_dispatch).
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  move-major-tag:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Move major tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          major="${TAG%%.*}"
+          if [ "$major" = "$TAG" ]; then
+            echo "::error::Release tag '$TAG' is not vX.Y.Z"
+            exit 1
+          fi
+          git tag -f "$major" "$TAG"
+          git push -f origin "refs/tags/$major"
+          echo "Moved $major -> $TAG ($(git rev-parse --short "$TAG"))"
+
+  scenario-tests:
+    needs: move-major-tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger scenario PRs in antidiffamine-test
+        env:
+          GH_TOKEN: ${{ secrets.TEST_REPO_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/antidiffamine/antidiffamine-test/dispatches \
+            -d "{\"event_type\":\"action-released\",\"client_payload\":{\"version\":\"$TAG\"}}"
+          echo "Results: https://github.com/antidiffamine/antidiffamine-test/actions/workflows/release-test.yml" >> "$GITHUB_STEP_SUMMARY"
