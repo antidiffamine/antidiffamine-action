@@ -91,7 +91,8 @@ runs:
         TARGET: ${{ inputs.target }}
         BASE_BRANCH: ${{ inputs.base_branch }}
       run: |
-        ref="$BASE_BRANCH"
+        # The clone only has a local branch for the default branch; use the remote-tracking ref
+        ref="origin/$BASE_BRANCH"
         echo "Using ref: $ref"
         echo "Resolving source_base for SOURCE=$SOURCE"
         source_base=$(git merge-base --fork-point "$ref" "$SOURCE" || git merge-base "$ref" "$SOURCE")
