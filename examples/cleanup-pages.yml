@@ -1,0 +1,49 @@
+# Copy to .github/workflows/cleanup-pages.yml in your repo to delete
+# hosted diffs on gh-pages older than 3 days.
+
+name: Cleanup old Pages diffs
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # daily at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+
+      - name: Remove diffs older than 3 days
+        run: |
+          git config user.email "antidiffamine@github-actions"
+          git config user.name "AntiDiffamine"
+
+          cutoff=$(date -d '3 days ago' +%s)
+          removed=0
+
+          for dir in runs/*/; do
+            [ -d "$dir" ] || continue
+            created_file="${dir}.created"
+            if [ -f "$created_file" ]; then
+              created=$(cat "$created_file")
+              if [ "$created" -lt "$cutoff" ]; then
+                echo "Removing $dir (created $created, cutoff $cutoff)"
+                git rm -rf "$dir"
+                removed=$((removed + 1))
+              fi
+            fi
+          done
+
+          if [ "$removed" -gt 0 ]; then
+            git commit -m "cleanup: remove ${removed} diff(s) older than 3 days"
+            git push
+          else
+            echo "Nothing to clean up"
+          fi

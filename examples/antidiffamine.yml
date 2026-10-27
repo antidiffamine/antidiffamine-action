@@ -1,0 +1,26 @@
+# Copy to .github/workflows/antidiffamine.yml in your repo.
+#
+# Whenever a PR branch is force-pushed, AntiDiffamine rebases the old commits
+# onto the new base and writes the resulting diff to the Actions run summary.
+
+name: AntiDiffamine
+
+on:
+  # pull_request_target gives the token write access on fork PRs too.
+  # AntiDiffamine only clones and rebases the PR commits; it never runs PR code.
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  contents: read        # change to write if you turn on pages
+  pull-requests: write  # post the PR comment (remove if comment: false)
+
+jobs:
+  antidiffamine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: antidiffamine/antidiffamine-action@v1
+        with:
+          comment: true        # post a PR comment linking to the diff
+          pages: false         # publish the HTML diff to GitHub Pages (see README)
+          html_enabled: true   # upload diff.html as a workflow artifact

@@ -1,0 +1,343 @@
+name: AntiDiffamine
+description: Show what a PR force-push really changed by rebasing the old commits onto the new base before diffing.
+author: AntiDiffamine
+
+branding:
+  icon: git-pull-request
+  color: blue
+
+inputs:
+  source:
+    description: Commit SHA before the force-push.
+    required: false
+    default: ${{ github.event.before }}
+  target:
+    description: Commit SHA after the force-push.
+    required: false
+    default: ${{ github.event.after }}
+  base_branch:
+    description: Base branch the PR targets (e.g. main).
+    required: false
+    default: ${{ github.base_ref }}
+  repo:
+    description: owner/repo containing the commits.
+    required: false
+    default: ${{ github.repository }}
+  token:
+    description: Token used to clone, push to gh-pages and comment. Needs contents:write for Pages and pull-requests:write for comments.
+    required: false
+    default: ${{ github.token }}
+  html_enabled:
+    description: Render diff.html and upload it as a workflow artifact.
+    required: false
+    default: 'true'
+  pages:
+    description: Publish diff.html to GitHub Pages (gh-pages branch). Requires html_enabled and contents:write.
+    required: false
+    default: 'false'
+  comment:
+    description: Post a PR comment linking to the diff (only on pull_request / pull_request_target events). Requires pull-requests:write.
+    required: false
+    default: 'true'
+  fail_on_rebase_failure:
+    description: Fail the step when both rebase attempts fail and only a partial diff could be rendered.
+    required: false
+    default: 'true'
+
+outputs:
+  bases_match:
+    description: "'true' when source and target share the same merge base (no rebase needed; diff and comment are skipped)."
+    value: ${{ steps.bases.outputs.bases_match }}
+  had_conflicts:
+    description: "'true' when the first rebase hit merge conflicts."
+    value: ${{ steps.first_rebase.outputs.had_conflicts }}
+  rebase_failed:
+    description: "'true' when the second rebase (-X theirs) also failed and the diff is partial."
+    value: ${{ steps.second_rebase.outputs.rebase_failed }}
+  page_url:
+    description: URL of the hosted diff page (live ~2-5 min after the job), empty if pages is off or Pages is not set up.
+    value: ${{ steps.deploy.outputs.page_url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Clone repo
+      shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        TARGET: ${{ inputs.target }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
+        REPO: ${{ inputs.repo }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        WORK: ${{ runner.temp }}/antidiffamine
+      run: |
+        for v in SOURCE TARGET BASE_BRANCH REPO; do
+          if [ -z "${!v}" ]; then
+            echo "::error title=AntiDiffamine::Missing input for $v. Outside pull_request events, pass source, target and base_branch explicitly."
+            exit 1
+          fi
+        done
+        rm -rf "$WORK" && mkdir -p "$WORK"
+        git clone --filter=blob:none "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" "$WORK/repo"
+        cd "$WORK/repo"
+        git fetch origin "$SOURCE" "$TARGET" "$BASE_BRANCH"
+
+    - name: Compute merge bases
+      id: bases
+      shell: bash
+      working-directory: ${{ runner.temp }}/antidiffamine/repo
+      env:
+        SOURCE: ${{ inputs.source }}
+        TARGET: ${{ inputs.target }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
+      run: |
+        ref="$BASE_BRANCH"
+        echo "Using ref: $ref"
+        echo "Resolving source_base for SOURCE=$SOURCE"
+        source_base=$(git merge-base --fork-point "$ref" "$SOURCE" || git merge-base "$ref" "$SOURCE")
+        echo "source_base=$source_base"
+        echo "Resolving target_base for TARGET=$TARGET"
+        target_base=$(git merge-base --fork-point "$ref" "$TARGET" || git merge-base "$ref" "$TARGET")
+        echo "target_base=$target_base"
+        echo "source_base=$source_base" >> "$GITHUB_OUTPUT"
+        echo "target_base=$target_base" >> "$GITHUB_OUTPUT"
+        if [ "$source_base" = "$target_base" ]; then
+          echo "bases_match=true" >> "$GITHUB_OUTPUT"
+          echo "Bases are identical — no rebase needed"
+        else
+          echo "bases_match=false" >> "$GITHUB_OUTPUT"
+          echo "Bases differ — rebase required"
+        fi
+
+    - name: First rebase (detect conflicts)
+      id: first_rebase
+      if: steps.bases.outputs.bases_match == 'false'
+      shell: bash
+      working-directory: ${{ runner.temp }}/antidiffamine/repo
+      env:
+        SOURCE: ${{ inputs.source }}
+        SOURCE_BASE: ${{ steps.bases.outputs.source_base }}
+        TARGET_BASE: ${{ steps.bases.outputs.target_base }}
+        GIT_AUTHOR_NAME: AntiDiffamine
+        GIT_AUTHOR_EMAIL: antidiffamine@github-actions
+        GIT_COMMITTER_NAME: AntiDiffamine
+        GIT_COMMITTER_EMAIL: antidiffamine@github-actions
+      run: |
+        git checkout "$SOURCE"
+        conflict_files=""
+        if ! git rebase --onto "$TARGET_BASE" "$SOURCE_BASE" HEAD; then
+          # Collect conflicting file paths and the conflict hunks
+          conflict_files=$(git diff --name-only --diff-filter=U)
+          {
+            echo "conflict_files<<EOF"
+            echo "$conflict_files"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          # Save full conflict markers for each file
+          for f in $conflict_files; do
+            echo "=== $f ===" >> conflict_details.txt
+            cat "$f" >> conflict_details.txt
+            echo "" >> conflict_details.txt
+          done
+          git rebase --abort
+          echo "had_conflicts=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "had_conflicts=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload conflict details
+      if: steps.first_rebase.outputs.had_conflicts == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: antidiffamine-conflict-details
+        path: ${{ runner.temp }}/antidiffamine/repo/conflict_details.txt
+
+    - name: Second rebase (strategy=theirs)
+      id: second_rebase
+      if: steps.first_rebase.outputs.had_conflicts == 'true'
+      shell: bash
+      working-directory: ${{ runner.temp }}/antidiffamine/repo
+      env:
+        SOURCE: ${{ inputs.source }}
+        SOURCE_BASE: ${{ steps.bases.outputs.source_base }}
+        TARGET_BASE: ${{ steps.bases.outputs.target_base }}
+        GIT_AUTHOR_NAME: AntiDiffamine
+        GIT_AUTHOR_EMAIL: antidiffamine@github-actions
+        GIT_COMMITTER_NAME: AntiDiffamine
+        GIT_COMMITTER_EMAIL: antidiffamine@github-actions
+      run: |
+        git checkout "$SOURCE"
+        if ! git rebase --onto "$TARGET_BASE" "$SOURCE_BASE" HEAD -X theirs; then
+          echo "Second rebase still has conflicts — saving partial diff before aborting"
+          git diff --stat > rebase_partial_stat.txt 2>/dev/null || true
+          git diff --unified=3 > rebase_partial_diff.txt 2>/dev/null || true
+          git log --oneline "${TARGET_BASE}..HEAD" > rebase_partial_commits.txt 2>/dev/null || true
+          git rebase --abort
+          echo "rebase_failed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "rebase_failed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: No rebase needed — direct compare
+      if: steps.bases.outputs.bases_match == 'true'
+      shell: bash
+      env:
+        COMPARE_URL: https://github.com/${{ inputs.repo }}/compare/${{ inputs.source }}..${{ inputs.target }}
+      run: |
+        {
+          echo "## 🧪 No AntiDiffamine needed"
+          echo ""
+          echo "Source and target share the same merge base — a direct compare covers the full diff."
+          echo ""
+          echo "[View comparison on GitHub](${COMPARE_URL})"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Render diff
+      if: steps.bases.outputs.bases_match == 'false'
+      shell: bash
+      working-directory: ${{ runner.temp }}/antidiffamine/repo
+      env:
+        SOURCE: ${{ inputs.source }}
+        TARGET: ${{ inputs.target }}
+        REPO: ${{ inputs.repo }}
+        SOURCE_BASE: ${{ steps.bases.outputs.source_base }}
+        TARGET_BASE: ${{ steps.bases.outputs.target_base }}
+        REBASE_FAILED: ${{ steps.second_rebase.outputs.rebase_failed }}
+        HTML_ENABLED: ${{ inputs.html_enabled }}
+        RENDER: ${{ github.action_path }}/src/render.py
+      run: |
+        if [ "$REBASE_FAILED" = "true" ]; then
+          from="__partial__"
+        else
+          from="HEAD"
+        fi
+        python3 "$RENDER" "$from" "$TARGET" "$REPO" "$SOURCE" "$SOURCE_BASE" "$TARGET_BASE" "$REBASE_FAILED" "$HTML_ENABLED"
+
+    - name: Upload diff HTML
+      if: inputs.html_enabled == 'true' && steps.bases.outputs.bases_match == 'false'
+      uses: actions/upload-artifact@v4
+      with:
+        name: antidiffamine-diff-html
+        path: ${{ runner.temp }}/antidiffamine/repo/diff.html
+
+    - name: Deploy to GitHub Pages
+      if: inputs.pages == 'true' && inputs.html_enabled == 'true' && steps.bases.outputs.bases_match == 'false'
+      id: deploy
+      shell: bash
+      working-directory: ${{ runner.temp }}/antidiffamine
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ inputs.token }}
+        RUN_ID: ${{ github.run_id }}
+      run: |
+        OWNER="${GITHUB_REPOSITORY_OWNER}"
+        REPO_NAME="${GITHUB_REPOSITORY#*/}"
+
+        # Check Pages config and print it for diagnostics
+        pages_config=$(gh api "repos/${GITHUB_REPOSITORY}/pages" 2>/dev/null || true)
+        if [ -z "$pages_config" ]; then
+          echo "GitHub Pages not enabled on ${GITHUB_REPOSITORY} — skipping Pages deployment"
+          echo "page_url=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "Pages config: $pages_config"
+        pages_source_branch=$(echo "$pages_config" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('source',{}).get('branch',''))" 2>/dev/null || true)
+        echo "Pages source branch: $pages_source_branch"
+        if [ "$pages_source_branch" != "gh-pages" ]; then
+          echo "Pages is not set to serve from gh-pages branch (currently: '$pages_source_branch')"
+          echo "Reconfiguring Pages source to gh-pages..."
+          gh api "repos/${GITHUB_REPOSITORY}/pages" \
+            --method PUT \
+            --field "source[branch]=gh-pages" \
+            --field "source[path]=/" \
+            --silent || echo "Could not reconfigure Pages source — please set it manually in Settings → Pages"
+        fi
+
+        # Clone gh-pages, or create the branch if it doesn't exist yet
+        if ! git clone --depth 1 --branch gh-pages \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            gh-pages-deploy 2>/dev/null; then
+          mkdir gh-pages-deploy && cd gh-pages-deploy
+          git init
+          git checkout -b gh-pages
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          cd ..
+        fi
+
+        # Disable Jekyll so GitHub Pages serves the files as-is
+        touch gh-pages-deploy/.nojekyll
+
+        # Root index so the bare Pages URL isn't a 404
+        if [ ! -f gh-pages-deploy/index.html ]; then
+          echo '<meta http-equiv="refresh" content="0;url=runs/">' > gh-pages-deploy/index.html
+        fi
+
+        mkdir -p "gh-pages-deploy/runs/${RUN_ID}"
+        cp repo/diff.html "gh-pages-deploy/runs/${RUN_ID}/index.html"
+        # Write Unix timestamp for cleanup comparisons
+        date -u +%s > "gh-pages-deploy/runs/${RUN_ID}/.created"
+
+        cd gh-pages-deploy
+        git config user.email "antidiffamine@github-actions"
+        git config user.name "AntiDiffamine"
+        git add .nojekyll index.html "runs/${RUN_ID}/"
+        git commit -m "diff: add run ${RUN_ID}"
+        if ! git push origin gh-pages; then
+          echo "Could not push to gh-pages (permission denied or branch protection) — skipping Pages deployment"
+          echo "To enable hosted diffs, grant this workflow 'contents: write' permission and set Pages to deploy from the gh-pages branch."
+          echo "page_url=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        PAGE_URL="https://${OWNER}.github.io/${REPO_NAME}/runs/${RUN_ID}/"
+        echo "page_url=$PAGE_URL" >> "$GITHUB_OUTPUT"
+        {
+          echo '<div style="border:2px solid #0969da;border-radius:8px;padding:16px;margin-bottom:16px">'
+          echo ""
+          echo "### 🌐 HTML Visualization"
+          echo ""
+          echo "[View hosted diff](${PAGE_URL})"
+          echo ""
+          echo "</div>"
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "Page URL: $PAGE_URL"
+
+    - name: Comment on PR
+      if: inputs.comment == 'true' && github.event.pull_request && steps.bases.outputs.bases_match == 'false'
+      uses: actions/github-script@v7
+      env:
+        PAGE_URL: ${{ steps.deploy.outputs.page_url }}
+        SOURCE: ${{ inputs.source }}
+        TARGET: ${{ inputs.target }}
+        BASE_BRANCH: ${{ inputs.base_branch }}
+        REBASE_FAILED: ${{ steps.second_rebase.outputs.rebase_failed }}
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const { PAGE_URL, SOURCE, TARGET, BASE_BRANCH, REBASE_FAILED } = process.env;
+          const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+          const lines = [
+            `🔁 **Force-push detected** — here's what changed:`,
+            ``,
+          ];
+          if (PAGE_URL) {
+            lines.push(`- 📄 [Rendered diff (GitHub Pages)](${PAGE_URL}) — live in ~2–5 min`);
+          }
+          lines.push(`- 📋 [Inline diff (Actions summary)](${runUrl}) — available now`);
+          if (REBASE_FAILED === 'true') {
+            lines.push(``, `> [!WARNING]`, `> AntiDiffamine could not resolve merge conflicts automatically; the diff is partial.`);
+          }
+          lines.push(``, `> Compares \`${SOURCE.slice(0, 7)}\` → \`${TARGET.slice(0, 7)}\` relative to \`${BASE_BRANCH}\``);
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.payload.pull_request.number,
+            body: lines.join('\n'),
+          });
+
+    - name: Fail if rebase could not be resolved
+      if: steps.second_rebase.outputs.rebase_failed == 'true' && inputs.fail_on_rebase_failure == 'true'
+      shell: bash
+      run: |
+        echo "::error title=AntiDiffamine::Both rebases failed — diff and conflicts were rendered as partial output."
+        exit 1
